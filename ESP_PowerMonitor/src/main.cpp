@@ -10,10 +10,11 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <Preferences.h>
+#include <math.h>
 // Configuration constants - ensuring proper null termination
 const char* mqtt_user = "steve";     
 const char* mqtt_pass = "Doctor*9";     
-const int FIRMWARE_VERSION = 1; 
+const int FIRMWARE_VERSION = 2; 
 const char* CONFIG_URL = "https://raw.githubusercontent.com/stevennolte/ESP_Home/main/ESP_PowerMonitor/Release/firmware.json";
 const char* ssid = "SSEI";
 const char* password = "Nd14il!la";
@@ -25,32 +26,48 @@ const int mqtt_port = 1883;
 const char* client_id = "ESP_Panel_Power_Monitor\0";
 const char* topic_currentA = "home/esp/panel/current_a\0";
 const char* topic_currentB = "home/esp/panel/current_b\0";
+const char* topic_currentCombined = "home/esp/panel/current_combined\0";
 const char* topic_currentA_daily = "home/esp/panel/current_a_daily\0";
 const char* topic_currentB_daily = "home/esp/panel/current_b_daily\0";
+const char* topic_currentCombined_daily = "home/esp/panel/current_combined_daily\0";
+const char* topic_voltageA = "home/esp/panel/voltage_a\0";
+const char* topic_voltageB = "home/esp/panel/voltage_b\0";
 const char* topic_uptime = "home/esp/panel/uptime\0";
 const char* topic_cpu_temp = "home/esp/panel/cpu_temp\0";
 const char* topic_reboot = "home/esp/panel/reboot\0";
 
 // GPIO voltage monitoring configuration
-const int GPIO_CHANNEL_A = 1; // GPIO1 for current sensor A
-const int GPIO_CHANNEL_B = 2; // GPIO2 for current sensor B
-const float CURRENT_MULTIPLIER = 30.0; // CT clamp ratio (adjust based on your CT clamp)
+const int GPIO_CHANNEL_A = 1; // Use A0 (GPIO36) for current sensor A
+const int GPIO_CHANNEL_B = 2; // Use A1 (GPIO39) for current sensor B
+// CT Clamp Configuration - SCT-013-030 (30A/1V)
+// The CT clamp outputs a sine wave centered at 1.65V (AC_OFFSET)
+// The amplitude of the sine wave is proportional to the AC current flowing through the primary
+// SCT-013-030 specifications: 30A primary = 1V RMS output
+const float CT_CLAMP_MAX_CURRENT = 30.0; // Maximum rated current in Amps
+const float CT_CLAMP_MAX_VOLTAGE = 1.0;  // Output voltage at max current (1V RMS)
+const float VOLTAGE_TO_CURRENT_SCALE = CT_CLAMP_MAX_CURRENT / CT_CLAMP_MAX_VOLTAGE; // 30 A/V
 const float GPIO_VOLTAGE_RANGE = 3.3; // ESP32 GPIO voltage range
 const int GPIO_RESOLUTION = 4095; // 12-bit ADC resolution
 
 // AC sampling configuration
 const int SAMPLES_PER_MEASUREMENT = 128; // Number of samples for RMS calculation
 const unsigned long SAMPLE_INTERVAL_US = 520; // ~1920 Hz sampling rate (32 samples per 60Hz cycle)
-const float AC_OFFSET = 1.65; // Assuming 3.3V/2 DC offset for AC signal
+const float AC_OFFSET = 1.65; // Sine wave centered at 1.65V
 
 // Current monitoring variables
 float currentA_instant = 0.0;
 float currentB_instant = 0.0;
+float currentCombined_instant = 0.0;
 float currentA_daily = 0.0;
 float currentB_daily = 0.0;
+float currentCombined_daily = 0.0;
+float voltageA_rms = 0.0;
+float voltageB_rms = 0.0;
+float dcOffsetA = 0.0;
+float dcOffsetB = 0.0;
 unsigned long lastReadingTime = 0;
 unsigned long lastDayReset = 0;
-const unsigned long readingInterval = 5000; // Read every 5 seconds (RMS calculation takes time)
+const unsigned long readingInterval = 1000; // Read every 5 seconds (RMS calculation takes time)
 
 // Uptime and system monitoring variables
 unsigned long lastSystemPublish = 0;
@@ -169,14 +186,18 @@ void checkForUpdates() {
 #pragma endregion
 
 // --- Current Monitoring Functions ---
-float readCurrentRMS(int gpio_pin) {
+float readCurrentRMS(int gpio_pin, float* rms_voltage_out, float* dc_offset_out) {
   float sum_squares = 0.0;
+  float sum_voltages = 0.0; // For calculating actual DC offset
   unsigned long start_time = micros();
   
-  // Take multiple samples to calculate RMS
+  // Take multiple samples to calculate RMS and measure DC offset
   for (int i = 0; i < SAMPLES_PER_MEASUREMENT; i++) {
     int adc_value = analogRead(gpio_pin);
     float voltage = (adc_value * GPIO_VOLTAGE_RANGE) / GPIO_RESOLUTION;
+    
+    // Accumulate voltage readings for DC offset calculation
+    sum_voltages += voltage;
     
     // Remove DC offset to get AC component
     float ac_voltage = voltage - AC_OFFSET;
@@ -190,18 +211,36 @@ float readCurrentRMS(int gpio_pin) {
     }
   }
   
+  // Calculate actual DC offset (average voltage)
+  float measured_dc_offset = sum_voltages / SAMPLES_PER_MEASUREMENT;
+  
+  // Store the measured DC offset for debugging
+  if (dc_offset_out != nullptr) {
+    *dc_offset_out = measured_dc_offset;
+  }
+  
   // Calculate RMS voltage
   float rms_voltage = sqrt(sum_squares / SAMPLES_PER_MEASUREMENT);
   
-  // Convert RMS voltage to RMS current using CT clamp ratio
-  float rms_current = rms_voltage * CURRENT_MULTIPLIER;
+  // Store the RMS voltage for output
+  if (rms_voltage_out != nullptr) {
+    *rms_voltage_out = rms_voltage;
+  }
+  
+  // Convert RMS voltage to RMS current using CT clamp specifications
+  // For SCT-013-030: 30A primary current = 1V RMS output
+  // Therefore: I_primary = V_rms * 30 A/V
+  float rms_current = rms_voltage * VOLTAGE_TO_CURRENT_SCALE;
   
   return rms_current;
 }
 
 void readCurrents() {
-  currentA_instant = readCurrentRMS(GPIO_CHANNEL_A); // Read RMS from GPIO1
-  currentB_instant = readCurrentRMS(GPIO_CHANNEL_B); // Read RMS from GPIO2
+  currentA_instant = readCurrentRMS(GPIO_CHANNEL_A, &voltageA_rms, &dcOffsetA); // Read RMS from GPIO1
+  currentB_instant = readCurrentRMS(GPIO_CHANNEL_B, &voltageB_rms, &dcOffsetB); // Read RMS from GPIO2
+  
+  // Calculate combined current (total of both channels)
+  currentCombined_instant = currentA_instant + currentB_instant;
   
   // Accumulate daily values (in Amp-hours)
   // Convert current (A) to Amp-hours by multiplying with time interval in hours
@@ -210,6 +249,7 @@ void readCurrents() {
   if (lastReadingTime > 0) { // Skip first reading
     currentA_daily += currentA_instant * timeInterval;
     currentB_daily += currentB_instant * timeInterval;
+    currentCombined_daily += currentCombined_instant * timeInterval;
   }
   
   lastReadingTime = millis();
@@ -218,6 +258,7 @@ void readCurrents() {
   if (millis() - lastDayReset > 24 * 60 * 60 * 1000UL) {
     currentA_daily = 0.0;
     currentB_daily = 0.0;
+    currentCombined_daily = 0.0;
     lastDayReset = millis();
     Serial.println("Daily current accumulation reset");
   }
@@ -226,25 +267,45 @@ void readCurrents() {
 void publishCurrents() {
   char currentA_str[10];
   char currentB_str[10];
+  char currentCombined_str[10];
   char currentA_daily_str[10];
   char currentB_daily_str[10];
+  char currentCombined_daily_str[10];
+  char voltageA_str[10];
+  char voltageB_str[10];
   
   // Convert floats to strings
   dtostrf(currentA_instant, 1, 2, currentA_str);
   dtostrf(currentB_instant, 1, 2, currentB_str);
+  dtostrf(currentCombined_instant, 1, 2, currentCombined_str);
   dtostrf(currentA_daily, 1, 3, currentA_daily_str);
   dtostrf(currentB_daily, 1, 3, currentB_daily_str);
+  dtostrf(currentCombined_daily, 1, 3, currentCombined_daily_str);
+  dtostrf(voltageA_rms, 1, 3, voltageA_str);
+  dtostrf(voltageB_rms, 1, 3, voltageB_str);
   
   // Publish instant values
   client.publish(topic_currentA, currentA_str);
   client.publish(topic_currentB, currentB_str);
+  client.publish(topic_currentCombined, currentCombined_str);
   
   // Publish daily accumulated values
   client.publish(topic_currentA_daily, currentA_daily_str);
   client.publish(topic_currentB_daily, currentB_daily_str);
+  client.publish(topic_currentCombined_daily, currentCombined_daily_str);
   
-  Serial.printf("Current A: %.2f A, Current B: %.2f A\n", currentA_instant, currentB_instant);
-  Serial.printf("Daily A: %.3f Ah, Daily B: %.3f Ah\n", currentA_daily, currentB_daily);
+  // Publish raw voltage measurements
+  client.publish(topic_voltageA, voltageA_str);
+  client.publish(topic_voltageB, voltageB_str);
+  
+  Serial.printf("Current A: %.2f A (%.3f V RMS), Current B: %.2f A (%.3f V RMS)\n", 
+                currentA_instant, voltageA_rms, currentB_instant, voltageB_rms);
+  Serial.printf("Combined: %.2f A, Daily A: %.3f Ah, Daily B: %.3f Ah, Daily Combined: %.3f Ah\n", 
+                currentCombined_instant, currentA_daily, currentB_daily, currentCombined_daily);
+  Serial.printf("DC Offset A: %.3f V, DC Offset B: %.3f V (Config: %.2f V)\n", 
+                dcOffsetA, dcOffsetB, AC_OFFSET);
+  Serial.printf("CT Clamp: %.0fA max / %.1fV max = %.0f A/V scaling\n", 
+                CT_CLAMP_MAX_CURRENT, CT_CLAMP_MAX_VOLTAGE, VOLTAGE_TO_CURRENT_SCALE);
 }
 
 // --- System Monitoring Functions ---
@@ -390,7 +451,7 @@ void setup() {
   lastDayReset = millis();
 
   // Temporarily disable automatic update check
-  // checkForUpdates();
+  checkForUpdates();
   lastUpdateCheck = millis();
   
   Serial.println("Setup complete!");
@@ -423,10 +484,10 @@ void loop() {
   }
 
   // Check for updates every 5 minutes (temporarily disabled)
-  // if (millis() - lastUpdateCheck > updateInterval) {
-  //   checkForUpdates();
-  //   lastUpdateCheck = millis();
-  // }
+  if (millis() - lastUpdateCheck > updateInterval) {
+    checkForUpdates();
+    lastUpdateCheck = millis();
+  }
 
   // Publish system info every 30 seconds
   if (millis() - lastSystemPublish > systemPublishInterval) {
