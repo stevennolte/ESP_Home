@@ -11,6 +11,11 @@
 #include <time.h>
 #include <Preferences.h>
 #include <math.h>
+
+// NTP Time Configuration
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = -5 * 3600;  // EST (UTC-5), adjust for your timezone
+const int daylightOffset_sec = 3600;   // Daylight saving time offset (1 hour)
 // Configuration constants - ensuring proper null termination
 const char* mqtt_user = "steve";     
 const char* mqtt_pass = "Doctor*9";     
@@ -34,11 +39,12 @@ const char* topic_voltageA = "home/esp/panel/voltage_a\0";
 const char* topic_voltageB = "home/esp/panel/voltage_b\0";
 const char* topic_uptime = "home/esp/panel/uptime\0";
 const char* topic_cpu_temp = "home/esp/panel/cpu_temp\0";
+const char* topic_firmware_version = "home/esp/panel/firmware_version\0";
 const char* topic_reboot = "home/esp/panel/reboot\0";
 
 // GPIO voltage monitoring configuration
-const int GPIO_CHANNEL_A = 1; // Use A0 (GPIO36) for current sensor A
-const int GPIO_CHANNEL_B = 2; // Use A1 (GPIO39) for current sensor B
+const int GPIO_CHANNEL_A = A0; // Use A0 (GPIO36) for current sensor A
+const int GPIO_CHANNEL_B = A1; // Use A1 (GPIO39) for current sensor B
 // CT Clamp Configuration - SCT-013-030 (30A/1V)
 // The CT clamp outputs a sine wave centered at 1.65V (AC_OFFSET)
 // The amplitude of the sine wave is proportional to the AC current flowing through the primary
@@ -67,7 +73,8 @@ float dcOffsetA = 0.0;
 float dcOffsetB = 0.0;
 unsigned long lastReadingTime = 0;
 unsigned long lastDayReset = 0;
-const unsigned long readingInterval = 1000; // Read every 5 seconds (RMS calculation takes time)
+int lastResetDay = -1; // Track which day we last reset on
+const unsigned long readingInterval = 1000; // Read every 1 second
 
 // Uptime and system monitoring variables
 unsigned long lastSystemPublish = 0;
@@ -82,6 +89,13 @@ Preferences preferences;
 
 unsigned long lastUpdateCheck = 0;
 const unsigned long updateInterval = 5 * 60 * 1000UL; // 5 minutes
+
+// Function declarations
+void saveDailyTotals();
+void loadDailyTotals();
+void resetDailyTotals();
+void checkMidnightReset();
+void printLocalTime();
 
 #pragma region OTA Update
 // --- OTA Update Functions ---
@@ -185,6 +199,106 @@ void checkForUpdates() {
 }
 #pragma endregion
 
+// --- Time and Date Functions ---
+void setupTime() {
+  Serial.println("Setting up time synchronization...");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  
+  // Wait for time to be set
+  int attempts = 0;
+  while (!time(nullptr) && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (time(nullptr)) {
+    Serial.println("\nTime synchronized successfully!");
+    printLocalTime();
+  } else {
+    Serial.println("\nFailed to synchronize time, will use 24-hour reset fallback");
+  }
+}
+
+void printLocalTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time");
+    return;
+  }
+  
+  char timeStr[50];
+  strftime(timeStr, sizeof(timeStr), "%A, %B %d %Y %H:%M:%S", &timeinfo);
+  Serial.printf("Current time: %s\n", timeStr);
+}
+
+void checkMidnightReset() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    // Fallback to 24-hour timer if NTP fails
+    if (millis() - lastDayReset > 24 * 60 * 60 * 1000UL) {
+      resetDailyTotals();
+    }
+    return;
+  }
+  
+  // Check if we've crossed into a new day
+  int currentDay = timeinfo.tm_yday; // Day of year (0-365)
+  
+  if (lastResetDay == -1) {
+    // First time setup - just record the current day
+    lastResetDay = currentDay;
+    // Save the initial day to storage
+    preferences.begin("power_monitor", false);
+    preferences.putInt("lastResetDay", lastResetDay);
+    preferences.end();
+  } else if (currentDay != lastResetDay) {
+    // New day detected - reset daily totals
+    resetDailyTotals();
+    lastResetDay = currentDay;
+    
+    char timeStr[50];
+    strftime(timeStr, sizeof(timeStr), "%A, %B %d %Y %H:%M:%S", &timeinfo);
+    Serial.printf("New day detected at: %s\n", timeStr);
+  }
+}
+
+void resetDailyTotals() {
+  currentA_daily = 0.0;
+  currentB_daily = 0.0;
+  currentCombined_daily = 0.0;
+  lastDayReset = millis();
+  
+  // Save reset values to persistent storage
+  saveDailyTotals();
+  
+  Serial.println("Daily current accumulation reset at midnight");
+}
+
+// --- Persistent Storage Functions ---
+void saveDailyTotals() {
+  preferences.begin("power_monitor", false);
+  preferences.putFloat("currentA_daily", currentA_daily);
+  preferences.putFloat("currentB_daily", currentB_daily);
+  preferences.putFloat("currentComb_daily", currentCombined_daily);
+  preferences.putInt("lastResetDay", lastResetDay);
+  preferences.end();
+}
+
+void loadDailyTotals() {
+  preferences.begin("power_monitor", true); // Read-only
+  
+  currentA_daily = preferences.getFloat("currentA_daily", 0.0);
+  currentB_daily = preferences.getFloat("currentB_daily", 0.0);
+  currentCombined_daily = preferences.getFloat("currentComb_daily", 0.0);
+  lastResetDay = preferences.getInt("lastResetDay", -1);
+  
+  preferences.end();
+  
+  Serial.printf("Loaded daily totals from storage: A=%.3f Ah, B=%.3f Ah, Combined=%.3f Ah\n", 
+                currentA_daily, currentB_daily, currentCombined_daily);
+}
+
 // --- Current Monitoring Functions ---
 float readCurrentRMS(int gpio_pin, float* rms_voltage_out, float* dc_offset_out) {
   float sum_squares = 0.0;
@@ -250,18 +364,19 @@ void readCurrents() {
     currentA_daily += currentA_instant * timeInterval;
     currentB_daily += currentB_instant * timeInterval;
     currentCombined_daily += currentCombined_instant * timeInterval;
+    
+    // Save to persistent storage every 60 readings (1 minute)
+    static int saveCounter = 0;
+    if (++saveCounter >= 60) {
+      saveDailyTotals();
+      saveCounter = 0;
+    }
   }
   
   lastReadingTime = millis();
   
-  // Reset daily accumulation at midnight (24 hours)
-  if (millis() - lastDayReset > 24 * 60 * 60 * 1000UL) {
-    currentA_daily = 0.0;
-    currentB_daily = 0.0;
-    currentCombined_daily = 0.0;
-    lastDayReset = millis();
-    Serial.println("Daily current accumulation reset");
-  }
+  // Check for midnight reset using actual time
+  checkMidnightReset();
 }
 
 void publishCurrents() {
@@ -306,6 +421,18 @@ void publishCurrents() {
                 dcOffsetA, dcOffsetB, AC_OFFSET);
   Serial.printf("CT Clamp: %.0fA max / %.1fV max = %.0f A/V scaling\n", 
                 CT_CLAMP_MAX_CURRENT, CT_CLAMP_MAX_VOLTAGE, VOLTAGE_TO_CURRENT_SCALE);
+  
+  // Print current time every few readings
+  static int timeDisplayCounter = 0;
+  if (++timeDisplayCounter >= 10) { // Show time every 10 readings (10 seconds)
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      char timeStr[30];
+      strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+      Serial.printf("Current time: %s\n", timeStr);
+    }
+    timeDisplayCounter = 0;
+  }
 }
 
 // --- System Monitoring Functions ---
@@ -339,11 +466,16 @@ void publishSystemInfo() {
   // Get uptime
   String uptimeStr = getUptime();
   
+  // Get firmware version
+  char versionStr[10];
+  sprintf(versionStr, "%d", FIRMWARE_VERSION);
+  
   // Publish to MQTT
   client.publish(topic_cpu_temp, tempStr);
   client.publish(topic_uptime, uptimeStr.c_str());
+  client.publish(topic_firmware_version, versionStr);
   
-  Serial.printf("CPU Temperature: %.1f°C, Uptime: %s\n", cpuTemp, uptimeStr.c_str());
+  Serial.printf("CPU Temperature: %.1f°C, Uptime: %s, Firmware: v%d\n", cpuTemp, uptimeStr.c_str(), FIRMWARE_VERSION);
 }
 
 // --- MQTT Functions ---
@@ -429,14 +561,22 @@ void setup() {
  
   // Initialize GPIO pins for analog reading
   Serial.println("Initializing GPIO pins for current monitoring...");
-  // GPIO1 and GPIO2 are automatically configured for analog input
-  Serial.printf("Using GPIO%d for Current A and GPIO%d for Current B\n", GPIO_CHANNEL_A, GPIO_CHANNEL_B);
+  // A0 and A1 are automatically configured for analog input
+  Serial.printf("Using GPIO%d (A0) for Current A and GPIO%d (A1) for Current B\n", A0, A1);
   
   Serial.println("Starting WiFi connection...");
   setup_wifi();
   Serial.println("Connected to WiFi");
   Serial.printf("Free heap after WiFi: %d bytes\n", ESP.getFreeHeap());
   delay(500);
+  
+  // Setup time synchronization after WiFi is connected
+  setupTime();
+  delay(500);
+  
+  // Load daily totals from persistent storage
+  loadDailyTotals();
+  
   Serial.println("Resolving MQTT server...");
   String mqttServerIP = resolveMQTTServer();
   Serial.printf("Using MQTT server: %s\n", mqttServerIP.c_str());
