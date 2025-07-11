@@ -19,7 +19,7 @@ const int daylightOffset_sec = 3600;   // Daylight saving time offset (1 hour)
 // Configuration constants - ensuring proper null termination
 const char* mqtt_user = "steve";     
 const char* mqtt_pass = "Doctor*9";     
-const int FIRMWARE_VERSION = 2; 
+const int FIRMWARE_VERSION = 3; 
 const char* CONFIG_URL = "https://raw.githubusercontent.com/stevennolte/ESP_Home/main/ESP_PowerMonitor/Release/firmware.json";
 const char* ssid = "SSEI";
 const char* password = "Nd14il!la";
